@@ -29,6 +29,30 @@ Twitter.configure do |config|
   config.oauth_token_secret = TWITTER_OAUTH_SECRET
 end
 
+def build_unknown_time_message(ship_name, short_url, arriving)
+  message = ""
+  # We don't know when the ship is arriving or leaving
+  direction_message = "arriving"
+  if arriving == 0
+    direction_message = "leaving"
+  end
+  message = "#{ship_name} will be #{direction_message} today, but I don't know exactly when.  See #{short_url} for current position"
+  # extra 29 because t.co URLs tend to be 20 chars, short_url tends to be 49 chars
+  if message.length > 140+29 
+    # Try something a bit shorter
+    message = "#{ship_name} will be #{direction_message} today.  See #{short_url}"
+    if message.length > 140+29
+      # Still too long
+      message = "#{ship_name} will be #{direction_message} today"
+      if message.length > 140
+        puts "####### That's one hell of a long ship"
+        puts message
+      end
+    end
+  end
+  message
+end
+
 def build_message(ship_name, short_url, arriving, minutes_before_activity)
   message = ""
   if minutes_before_activity > 0
@@ -86,6 +110,30 @@ def check_for_activity(database, time, minutes_before_activity)
   end
 end
 
+def announce_unknown_time(database, ship_name, direction)
+  database.execute("select rowid, * from ships where name = '#{ship_name}'").each do |ship|
+    short_url = ""
+    unless ship[3].nil? || ship[3].empty?
+      short_url = BitLy.shorten(ship[3])
+    end
+    message = build_unknown_time_message(ship[1], short_url, direction)
+    puts message
+    # Tweet about it
+    begin
+      Twitter.update(message)
+    rescue Timeout::Error
+      puts Time.now.to_s+" Timeout::Error when tweeting."
+      sleep 40
+    rescue
+      # Not much we can do if something goes wrong, just wait for a bit
+      # and then carry on
+      puts Time.now.to_s+" Something went wrong when tweeting.  Error was:"
+      puts $!
+      sleep 40
+    end
+  end
+end
+
 def announce_activity(database, ship_name, direction, minutes_before_activity)
   #database.execute("select rowid, * from ships where name = '?'", [ship_name]).each do |ship|
   database.execute("select rowid, * from ships where name = '#{ship_name}'").each do |ship|
@@ -115,7 +163,8 @@ end
 db = SQLite3::Database.new "pier_head.db"
 
 ## Get the ical feed of visits
-uri = URI.parse("https://views.scraperwiki.com/run/liverpool_cruise_call_schedule_icalendar/")
+#uri = URI.parse("https://views.scraperwiki.com/run/liverpool_cruise_call_schedule_icalendar/")
+uri = URI.parse("http://box.scraperwiki.com/djmr3uq/9e92e0a3c3334e4/http/liverpool.ics")
 http = Net::HTTP.new(uri.host, 443)
 http.use_ssl = true
 request = Net::HTTP::Get.new(uri.request_uri)
@@ -149,7 +198,12 @@ cals.each do |cal|
     start_time = tz.local_to_utc(ev.start_time)
     finish_time = tz.local_to_utc(ev.finish_time)
     #puts ev.summary
-    #puts ship
+    puts ship
+    # Check whether we've got this ship in the database (so we catch missing
+    # URLs /before/ we've tweeted about them)
+    if db.execute("select rowid, * from ships where name = '#{ship}'").empty?
+      puts "We don't know about #{ship}"
+    end
     #puts start_time.to_s+" - "+finish_time.to_s
     #puts
     puts "   Finish time "+finish_time.to_s
@@ -162,28 +216,49 @@ cals.each do |cal|
     puts "now.to_datetime.inspect: "+now.to_datetime.inspect
     puts
 
-    # Look for ships arriving
-    [30, 15, 0].each do |mins_before_activity|
-      if (start_time >= (now+(mins_before_activity*60)).to_datetime) && (start_time < (now+((mins_before_activity+5)*60)).to_datetime)
-        puts "Would've found a start"
-	puts
+    # If it's ~7am, announce any arrivals/departures where
+    # we don't know the exact time of arrival/departure
+    # This assumes that arrival/departure times of 23:00/00:00 are "not known"
+    if Time.now.hour == 7 && now.min == 0
+      # Look for ships where we know they're arriving today but not exactly when
+      if start_time == tz.local_to_utc(Date.today.to_datetime)
+        announce_unknown_time(db, ship, 1)
       end
-      if (start_time.to_s >= (now+(mins_before_activity*60)).to_datetime.to_s) && (start_time.to_s < (now+((mins_before_activity+5)*60)).to_datetime.to_s)
-        puts "Ship arriving in "+mins_before_activity.to_s
-	puts
-        announce_activity(db, ship, 1, mins_before_activity)
+      # And now for ones leaving at some point today
+      if finish_time == tz.local_to_utc(Date.today.to_datetime)
+        announce_unknown_time(db, ship, 0)
       end
     end
-    # And now look for ships departing
-    [30, 15, 0].each do |mins_before_activity|
-      if (finish_time >= (now+(mins_before_activity*60)).to_datetime) && (finish_time < (now+((mins_before_activity+5)*60)).to_datetime)
-        puts "Would've found a finish"
-	puts
+
+    # If it's a ship where we know the arrival time
+    if start_time.hour != 23 && start_time.hour != 0
+      # Look for ships arriving
+      [30, 15, 0].each do |mins_before_activity|
+        if (start_time >= (now+(mins_before_activity*60)).to_datetime) && (start_time < (now+((mins_before_activity+5)*60)).to_datetime)
+          puts "Would've found a start"
+          puts
+        end
+        if (start_time.to_s >= (now+(mins_before_activity*60)).to_datetime.to_s) && (start_time.to_s < (now+((mins_before_activity+5)*60)).to_datetime.to_s)
+          puts "Ship arriving in "+mins_before_activity.to_s
+          puts
+          announce_activity(db, ship, 1, mins_before_activity)
+        end
       end
-      if (finish_time.to_s >= (now+(mins_before_activity*60)).to_datetime.to_s) && (finish_time.to_s < (now+((mins_before_activity+5)*60)).to_datetime.to_s)
-        puts "Ship leaving in "+mins_before_activity.to_s
-	puts
-        announce_activity(db, ship, 0, mins_before_activity)
+    end
+
+    # If it's a ship where we know the departure time
+    if finish_time.hour != 23 && finish_time.hour != 0
+      # And now look for ships departing
+      [30, 15, 0].each do |mins_before_activity|
+        if (finish_time >= (now+(mins_before_activity*60)).to_datetime) && (finish_time < (now+((mins_before_activity+5)*60)).to_datetime)
+          puts "Would've found a finish"
+          puts
+        end
+        if (finish_time.to_s >= (now+(mins_before_activity*60)).to_datetime.to_s) && (finish_time.to_s < (now+((mins_before_activity+5)*60)).to_datetime.to_s)
+          puts "Ship leaving in "+mins_before_activity.to_s
+          puts
+          announce_activity(db, ship, 0, mins_before_activity)
+        end
       end
     end
   end
